@@ -1,11 +1,11 @@
-"""Compliant, multi-layer Instagram media resolver.
+"""Compliant, multi-layer Instagram media resolver supporting authenticated sessions.
 
 Resolution Hierarchy:
 1. Offline Mock Mode (for automated testing and sandbox environments)
-2. Native yt-dlp Extractor (industry-standard, zero-token, robust CDN extraction)
-3. Official Meta Graph API (when INSTAGRAM_ACCESS_TOKEN is configured)
-4. Instagram Web GraphQL Query API (doc_id 10015901848480474 with X-IG-App-ID)
-5. Instagram Web Item Info API (?__a=1&__d=dis with X-IG-App-ID)
+2. Native yt-dlp Extractor (with optional sessionid / user/pass authentication)
+3. Authenticated Instagram Web GraphQL Query API (doc_id 10015901848480474)
+4. Authenticated Instagram Web Item Info API (?__a=1&__d=dis)
+5. Official Meta Graph API (when INSTAGRAM_ACCESS_TOKEN is configured)
 6. Public Embed Frame & OpenGraph fallback
 """
 
@@ -59,7 +59,7 @@ class InstagramAPIError(InstagramError):
 
 
 class InstagramClient:
-    """Client for resolving Instagram media via compliant official and public APIs."""
+    """Client for resolving Instagram media via compliant official, authenticated, and public APIs."""
 
     GRAPH_API_BASE = "https://graph.facebook.com/v19.0"
 
@@ -68,20 +68,26 @@ class InstagramClient:
         self._http_client = http_client
         self._owns_http_client = http_client is None
 
+    def _get_base_headers(self) -> Dict[str, str]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": INSTAGRAM_WEB_APP_ID,
+        }
+        if self.config.instagram_session_id:
+            headers["Cookie"] = f"sessionid={self.config.instagram_session_id};"
+        return headers
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(
                 timeout=self.config.request_timeout_seconds,
                 follow_redirects=True,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "X-IG-App-ID": INSTAGRAM_WEB_APP_ID,
-                },
+                headers=self._get_base_headers(),
             )
         return self._http_client
 
@@ -102,7 +108,7 @@ class InstagramClient:
         if self.config.instagram_auth_method == "mock":
             return self._resolve_mock(parsed_url)
 
-        # 2. Native yt-dlp Extractor (Zero-Token, robust CDN extraction)
+        # 2. Native yt-dlp Extractor (Supports sessionid & credentials)
         try:
             return await self._resolve_via_ytdlp(parsed_url)
         except ImportError:
@@ -110,51 +116,57 @@ class InstagramClient:
         except Exception as e:
             logger.warning("yt-dlp extractor error (%s), attempting API fallback", e)
 
-        # 3. Official Meta Graph API (if access token provided)
-        if self.config.instagram_access_token:
-            try:
-                return await self._resolve_via_graph_api(parsed_url)
-            except Exception as e:
-                logger.warning(
-                    "Meta Graph API resolution failed (%s), falling back to public resolver", e
-                )
-
-        # 4. Instagram Web GraphQL Query
+        # 3. Instagram Web GraphQL Query (authenticated with sessionid if provided)
         try:
             return await self._resolve_via_graphql(parsed_url)
         except Exception as e:
             logger.debug("GraphQL query failed (%s), trying item info endpoint", e)
 
-        # 5. Instagram Web Item Info API (?__a=1&__d=dis)
+        # 4. Instagram Web Item Info API (?__a=1&__d=dis)
         try:
             return await self._resolve_via_item_info(parsed_url)
         except Exception as e:
-            logger.debug("Item info endpoint failed (%s), trying embed frame", e)
+            logger.debug("Item info endpoint failed (%s), trying Meta API", e)
+
+        # 5. Official Meta Graph API (if access token provided)
+        if self.config.instagram_access_token:
+            try:
+                return await self._resolve_via_graph_api(parsed_url)
+            except Exception as e:
+                logger.warning("Meta Graph API resolution failed (%s)", e)
 
         # 6. Public Embed Frame Fallback
         return await self._resolve_via_public_embed(parsed_url)
 
     async def _resolve_via_ytdlp(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
-        """Extracts media directly using yt-dlp without requiring any Meta Developer tokens."""
-        import yt_dlp  # Raises ImportError if not installed
+        """Extracts media directly using yt-dlp with optional authenticated session."""
+        import yt_dlp
 
         loop = asyncio.get_running_loop()
 
         def _extract():
+            http_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            if self.config.instagram_session_id:
+                http_headers["Cookie"] = f"sessionid={self.config.instagram_session_id};"
+
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
                 "extract_flat": False,
-                "http_headers": {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
+                "http_headers": http_headers,
             }
+            if self.config.instagram_username and self.config.instagram_password:
+                ydl_opts["username"] = self.config.instagram_username
+                ydl_opts["password"] = self.config.instagram_password
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(parsed_url.canonical_url, download=False)
 
@@ -225,7 +237,7 @@ class InstagramClient:
             username=username,
             caption=caption,
             items=items,
-            is_authenticated=False,
+            is_authenticated=bool(self.config.instagram_session_id or self.config.instagram_password),
         )
 
     def _resolve_mock(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
@@ -376,7 +388,7 @@ class InstagramClient:
             username=username,
             caption=caption,
             items=items,
-            is_authenticated=False,
+            is_authenticated=bool(self.config.instagram_session_id),
         )
 
     async def _resolve_via_item_info(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
@@ -470,7 +482,7 @@ class InstagramClient:
             username=username,
             caption=caption,
             items=items,
-            is_authenticated=False,
+            is_authenticated=bool(self.config.instagram_session_id),
         )
 
     async def _resolve_via_public_embed(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:

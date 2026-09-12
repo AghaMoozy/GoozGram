@@ -36,6 +36,9 @@ class Config:
     telegram_bot_token: str
     authorized_telegram_user_ids: Set[int] = field(default_factory=set)
     instagram_account: str = ""
+    instagram_username: str = ""
+    instagram_password: str = ""
+    instagram_session_id: str = ""
     instagram_auth_method: str = "graph_api"  # "graph_api", "oembed", "webhook", "mock"
     instagram_access_token: str = ""
     instagram_app_secret: str = ""
@@ -106,10 +109,16 @@ class Config:
         except ValueError:
             webhook_port = 8000
 
+        ig_account = os.getenv("INSTAGRAM_ACCOUNT", "").strip()
+        ig_username = os.getenv("INSTAGRAM_USERNAME", "").strip() or ig_account
+
         cfg = cls(
             telegram_bot_token=bot_token,
             authorized_telegram_user_ids=auth_users,
-            instagram_account=os.getenv("INSTAGRAM_ACCOUNT", "").strip(),
+            instagram_account=ig_account or ig_username,
+            instagram_username=ig_username,
+            instagram_password=os.getenv("INSTAGRAM_PASSWORD", "").strip(),
+            instagram_session_id=os.getenv("INSTAGRAM_SESSION_ID", "").strip(),
             instagram_auth_method=os.getenv("INSTAGRAM_AUTH_METHOD", "graph_api").strip(),
             instagram_access_token=os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip(),
             instagram_app_secret=os.getenv("INSTAGRAM_APP_SECRET", "").strip(),
@@ -134,16 +143,11 @@ class Config:
         return cfg
 
     def is_user_authorized(self, user_id: int) -> bool:
-        """Checks if a user ID is authorized.
-
-        If no users are configured, access is denied by default for security.
-        """
         if not self.authorized_telegram_user_ids:
             return False
         return user_id in self.authorized_telegram_user_ids
 
     def get_sqlite_path(self) -> str:
-        """Extracts the file path from a sqlite URL."""
         if self.database_url.startswith("sqlite:///"):
             return self.database_url.replace("sqlite:///", "")
         if self.database_url.startswith("sqlite://"):
@@ -157,19 +161,16 @@ class Config:
             if len(self.telegram_bot_token) > 8
             else "[REDACTED]"
         )
-        masked_ig_token = (
-            f"{self.instagram_access_token[:4]}...{self.instagram_access_token[-4:]}"
-            if len(self.instagram_access_token) > 8
-            else ("[EMPTY]" if not self.instagram_access_token else "[REDACTED]")
-        )
+        has_pwd = "[CONFIGURED]" if self.instagram_password else "[EMPTY]"
+        has_sess = "[CONFIGURED]" if self.instagram_session_id else "[EMPTY]"
 
         return (
             f"Config("
             f"telegram_bot_token='{masked_token}', "
             f"authorized_users={list(self.authorized_telegram_user_ids)}, "
-            f"instagram_account='{self.instagram_account}', "
-            f"instagram_auth_method='{self.instagram_auth_method}', "
-            f"instagram_token='{masked_ig_token}', "
+            f"instagram_username='{self.instagram_username}', "
+            f"instagram_password={has_pwd}, "
+            f"instagram_session_id={has_sess}, "
             f"database_url='{self.database_url}', "
             f"download_dir='{self.download_dir}', "
             f"keep_downloads={self.keep_downloads}, "

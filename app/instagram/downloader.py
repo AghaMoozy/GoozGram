@@ -47,10 +47,13 @@ class MediaDownloader:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
+            headers = {"User-Agent": "PersonalInstagramBot/1.0"}
+            if self.config.instagram_session_id:
+                headers["Cookie"] = f"sessionid={self.config.instagram_session_id};"
             self._http_client = httpx.AsyncClient(
                 timeout=self.config.request_timeout_seconds,
                 follow_redirects=True,
-                headers={"User-Agent": "PersonalInstagramBot/1.0"},
+                headers=headers,
             )
         return self._http_client
 
