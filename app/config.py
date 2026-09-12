@@ -39,6 +39,8 @@ class Config:
     instagram_username: str = ""
     instagram_password: str = ""
     instagram_session_id: str = ""
+    instagram_cookies: str = ""
+    instagram_cookies_file: str = ""
     instagram_auth_method: str = "graph_api"  # "graph_api", "oembed", "webhook", "mock"
     instagram_access_token: str = ""
     instagram_app_secret: str = ""
@@ -119,6 +121,8 @@ class Config:
             instagram_username=ig_username,
             instagram_password=os.getenv("INSTAGRAM_PASSWORD", "").strip(),
             instagram_session_id=os.getenv("INSTAGRAM_SESSION_ID", "").strip(),
+            instagram_cookies=os.getenv("INSTAGRAM_COOKIES", "").strip(),
+            instagram_cookies_file=os.getenv("INSTAGRAM_COOKIES_FILE", "").strip(),
             instagram_auth_method=os.getenv("INSTAGRAM_AUTH_METHOD", "graph_api").strip(),
             instagram_access_token=os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip(),
             instagram_app_secret=os.getenv("INSTAGRAM_APP_SECRET", "").strip(),
@@ -163,6 +167,7 @@ class Config:
         )
         has_pwd = "[CONFIGURED]" if self.instagram_password else "[EMPTY]"
         has_sess = "[CONFIGURED]" if self.instagram_session_id else "[EMPTY]"
+        has_cookies = "[CONFIGURED]" if (self.instagram_cookies or self.instagram_cookies_file) else "[EMPTY]"
 
         return (
             f"Config("
@@ -171,6 +176,7 @@ class Config:
             f"instagram_username='{self.instagram_username}', "
             f"instagram_password={has_pwd}, "
             f"instagram_session_id={has_sess}, "
+            f"instagram_cookies={has_cookies}, "
             f"database_url='{self.database_url}', "
             f"download_dir='{self.download_dir}', "
             f"keep_downloads={self.keep_downloads}, "
