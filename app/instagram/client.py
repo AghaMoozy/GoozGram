@@ -1,9 +1,11 @@
 """Compliant, multi-layer Instagram media resolver.
 
-Supports:
+Resolution Strategy:
 1. Official Meta Graph API (when INSTAGRAM_ACCESS_TOKEN is configured)
-2. Public Instagram embed & OpenGraph stream resolution (for public posts/reels without token)
-3. Mock mode for offline testing and verification
+2. Instagram Web GraphQL Query API (doc_id 10015901848480474 with X-IG-App-ID)
+3. Instagram Web Item Info API (?__a=1&__d=dis with X-IG-App-ID)
+4. Public Embed Frame & OpenGraph fallback
+5. Offline Mock mode for automated testing
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote
 
 import httpx
 
@@ -22,6 +23,10 @@ from app.instagram.models import ContentType, InstagramContent, InstagramMediaIt
 from app.instagram.parser import ParsedInstagramUrl
 
 logger = logging.getLogger(__name__)
+
+# Standard public web app identifier used by Instagram's web application
+INSTAGRAM_WEB_APP_ID = "936619743392459"
+GRAPHQL_DOC_ID = "10015901848480474"
 
 
 class InstagramError(Exception):
@@ -74,6 +79,7 @@ class InstagramClient:
                         "Chrome/124.0.0.0 Safari/537.36"
                     ),
                     "Accept-Language": "en-US,en;q=0.9",
+                    "X-IG-App-ID": INSTAGRAM_WEB_APP_ID,
                 },
             )
         return self._http_client
@@ -91,11 +97,11 @@ class InstagramClient:
             parsed_url.content_type.value,
         )
 
-        # 1. Simulation / Offline Mock Mode
+        # 1. Offline Mock Mode
         if self.config.instagram_auth_method == "mock":
             return self._resolve_mock(parsed_url)
 
-        # 2. If Meta Access Token is configured, attempt official Graph API first
+        # 2. Official Meta Graph API (if access token provided)
         if self.config.instagram_access_token:
             try:
                 return await self._resolve_via_graph_api(parsed_url)
@@ -104,13 +110,23 @@ class InstagramClient:
                     "Meta Graph API resolution failed (%s), falling back to public resolver", e
                 )
 
-        # 3. Public Web Embed & OpenGraph resolver (Fallback for public posts/reels without token)
+        # 3. Instagram Web GraphQL Query
+        try:
+            return await self._resolve_via_graphql(parsed_url)
+        except Exception as e:
+            logger.debug("GraphQL query failed (%s), trying item info endpoint", e)
+
+        # 4. Instagram Web Item Info API (?__a=1&__d=dis)
+        try:
+            return await self._resolve_via_item_info(parsed_url)
+        except Exception as e:
+            logger.debug("Item info endpoint failed (%s), trying embed frame", e)
+
+        # 5. Public Embed Frame & OpenGraph Fallback
         return await self._resolve_via_public_embed(parsed_url)
 
     def _resolve_mock(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
-        """Returns mock content for testing and sandbox environments."""
         content_id = parsed_url.content_id
-
         if "deleted" in content_id.lower() or "404" in content_id:
             raise InstagramContentNotFoundError("This post has been deleted or is unavailable.")
         if "private" in content_id.lower():
@@ -149,53 +165,28 @@ class InstagramClient:
                 is_authenticated=True,
             )
 
-        # Video / Reel mock
-        if parsed_url.content_type == ContentType.REEL or "video" in content_id.lower():
-            items = [
-                InstagramMediaItem(
-                    url="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-                    media_type=MediaType.VIDEO,
-                    content_id=content_id,
-                    item_id=f"{content_id}_video",
-                    mime_type="video/mp4",
-                )
-            ]
-            return InstagramContent(
-                content_id=content_id,
-                original_url=parsed_url.raw_url,
-                canonical_url=parsed_url.canonical_url,
-                content_type=ContentType.REEL,
-                username=self.config.instagram_account or "reels_creator",
-                caption="Mock Reel video downloaded successfully.",
-                items=items,
-                is_authenticated=True,
-            )
-
-        # Standard Photo Post mock
         items = [
             InstagramMediaItem(
-                url="https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800",
-                media_type=MediaType.PHOTO,
+                url="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+                media_type=MediaType.VIDEO,
                 content_id=content_id,
-                item_id=f"{content_id}_photo",
-                mime_type="image/jpeg",
+                item_id=f"{content_id}_video",
+                mime_type="video/mp4",
             )
         ]
         return InstagramContent(
             content_id=content_id,
             original_url=parsed_url.raw_url,
             canonical_url=parsed_url.canonical_url,
-            content_type=ContentType.POST,
-            username=self.config.instagram_account or "instagram_user",
-            caption="Mock Single Image post downloaded successfully.",
+            content_type=ContentType.REEL,
+            username="reels_creator",
+            caption="Mock Reel video downloaded successfully.",
             items=items,
             is_authenticated=True,
         )
 
     async def _resolve_via_graph_api(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
-        """Resolves media via official Meta Graph API endpoints."""
         client = await self._get_client()
-
         oembed_url = f"{self.GRAPH_API_BASE}/instagram_oembed"
         params: Dict[str, str] = {
             "url": parsed_url.canonical_url,
@@ -203,37 +194,18 @@ class InstagramClient:
             "access_token": self.config.instagram_access_token,
         }
 
-        try:
-            response = await client.get(oembed_url, params=params)
-        except httpx.RequestError as e:
-            logger.error("Network error contacting Meta API: %s", e)
-            raise InstagramAPIError(f"Network error communicating with Instagram API: {e}") from e
-
-        if response.status_code == 401:
-            raise InstagramAuthenticationError("Meta Graph API access token is invalid or expired.")
-        if response.status_code == 403:
-            raise InstagramPermissionDeniedError(
-                "Access denied by Instagram. The account may be private or permissions are missing."
-            )
-        if response.status_code == 404:
-            raise InstagramContentNotFoundError("The requested Instagram content was not found or was deleted.")
-        if response.status_code == 429:
-            raise InstagramRateLimitError("Meta API rate limit exceeded. Please wait before retrying.")
-
+        response = await client.get(oembed_url, params=params)
         if response.status_code != 200:
-            raise InstagramAPIError(f"Instagram API returned status {response.status_code}: {response.text}")
+            raise InstagramAPIError(f"Meta Graph API error status: {response.status_code}")
 
         data = response.json()
-        author_name = data.get("author_name", "")
-        title = data.get("title", "")
         thumbnail_url = data.get("thumbnail_url", "")
-
         if not thumbnail_url:
             raise InstagramAPIError("No media stream or thumbnail URL returned by Meta API.")
 
         media_type = (
             MediaType.VIDEO
-            if parsed_url.content_type == ContentType.REEL or "video" in title.lower()
+            if parsed_url.content_type == ContentType.REEL or "video" in data.get("title", "").lower()
             else MediaType.PHOTO
         )
 
@@ -242,8 +214,6 @@ class InstagramClient:
             media_type=media_type,
             content_id=parsed_url.content_id,
             item_id=f"{parsed_url.content_id}_0",
-            width=data.get("thumbnail_width"),
-            height=data.get("thumbnail_height"),
         )
 
         return InstagramContent(
@@ -251,10 +221,187 @@ class InstagramClient:
             original_url=parsed_url.raw_url,
             canonical_url=parsed_url.canonical_url,
             content_type=parsed_url.content_type,
-            username=author_name,
-            caption=title,
+            username=data.get("author_name", ""),
+            caption=data.get("title", ""),
             items=[item],
             is_authenticated=True,
+        )
+
+    async def _resolve_via_graphql(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
+        """Queries Instagram Web GraphQL endpoint with doc_id 10015901848480474."""
+        client = await self._get_client()
+        shortcode = parsed_url.content_id
+        api_url = "https://www.instagram.com/api/v1/graphql/query"
+
+        payload = {
+            "doc_id": GRAPHQL_DOC_ID,
+            "variables": json.dumps({"shortcode": shortcode}),
+        }
+
+        resp = await client.post(
+            api_url,
+            data=payload,
+            headers={
+                "X-IG-App-ID": INSTAGRAM_WEB_APP_ID,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": parsed_url.canonical_url,
+            },
+        )
+
+        if resp.status_code != 200:
+            raise InstagramAPIError(f"GraphQL returned HTTP status {resp.status_code}")
+
+        data = resp.json()
+        media_data = data.get("data", {}).get("xdt_shortcode_media")
+        if not media_data:
+            raise InstagramAPIError("No media found in GraphQL response")
+
+        username = media_data.get("owner", {}).get("username", "")
+        caption = ""
+        caption_edges = media_data.get("edge_media_to_caption", {}).get("edges", [])
+        if caption_edges:
+            caption = caption_edges[0].get("node", {}).get("text", "")
+
+        # Check for Carousel items
+        carousel_edges = media_data.get("edge_sidecar_to_children", {}).get("edges", [])
+        items: List[InstagramMediaItem] = []
+
+        if carousel_edges:
+            for idx, edge in enumerate(carousel_edges):
+                node = edge.get("node", {})
+                is_vid = node.get("is_video", False)
+                url = node.get("video_url") if is_vid else node.get("display_url")
+                if url:
+                    items.append(
+                        InstagramMediaItem(
+                            url=url,
+                            media_type=MediaType.VIDEO if is_vid else MediaType.PHOTO,
+                            content_id=shortcode,
+                            item_id=f"{shortcode}_{idx}",
+                            mime_type="video/mp4" if is_vid else "image/jpeg",
+                        )
+                    )
+            content_type = ContentType.CAROUSEL
+        else:
+            is_vid = media_data.get("is_video", False)
+            url = media_data.get("video_url") if is_vid else media_data.get("display_url")
+            if not url:
+                raise InstagramAPIError("No media stream URL found in GraphQL media object")
+            items.append(
+                InstagramMediaItem(
+                    url=url,
+                    media_type=MediaType.VIDEO if is_vid else MediaType.PHOTO,
+                    content_id=shortcode,
+                    item_id=f"{shortcode}_main",
+                    mime_type="video/mp4" if is_vid else "image/jpeg",
+                )
+            )
+            content_type = ContentType.REEL if (is_vid and parsed_url.content_type == ContentType.REEL) else (ContentType.POST if not is_vid else ContentType.REEL)
+
+        return InstagramContent(
+            content_id=shortcode,
+            original_url=parsed_url.raw_url,
+            canonical_url=parsed_url.canonical_url,
+            content_type=content_type,
+            username=username,
+            caption=caption,
+            items=items,
+            is_authenticated=False,
+        )
+
+    async def _resolve_via_item_info(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
+        """Queries Instagram Web Item Info API (?__a=1&__d=dis)."""
+        client = await self._get_client()
+        shortcode = parsed_url.content_id
+        url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+
+        resp = await client.get(
+            url,
+            headers={
+                "X-IG-App-ID": INSTAGRAM_WEB_APP_ID,
+                "Referer": parsed_url.canonical_url,
+            },
+        )
+
+        if resp.status_code != 200:
+            raise InstagramAPIError(f"Item info API returned HTTP {resp.status_code}")
+
+        data = resp.json()
+        items_list = data.get("items", [])
+        if not items_list:
+            raise InstagramAPIError("No items array in response")
+
+        item_data = items_list[0]
+        username = item_data.get("user", {}).get("username", "")
+        caption = item_data.get("caption", {}).get("text", "") if item_data.get("caption") else ""
+
+        carousel_media = item_data.get("carousel_media", [])
+        items: List[InstagramMediaItem] = []
+
+        if carousel_media:
+            for idx, c_item in enumerate(carousel_media):
+                vid_versions = c_item.get("video_versions", [])
+                if vid_versions:
+                    items.append(
+                        InstagramMediaItem(
+                            url=vid_versions[0].get("url"),
+                            media_type=MediaType.VIDEO,
+                            content_id=shortcode,
+                            item_id=f"{shortcode}_{idx}",
+                            mime_type="video/mp4",
+                        )
+                    )
+                else:
+                    img_candidates = c_item.get("image_versions2", {}).get("candidates", [])
+                    if img_candidates:
+                        items.append(
+                            InstagramMediaItem(
+                                url=img_candidates[0].get("url"),
+                                media_type=MediaType.PHOTO,
+                                content_id=shortcode,
+                                item_id=f"{shortcode}_{idx}",
+                                mime_type="image/jpeg",
+                            )
+                        )
+            content_type = ContentType.CAROUSEL
+        else:
+            vid_versions = item_data.get("video_versions", [])
+            if vid_versions:
+                items.append(
+                    InstagramMediaItem(
+                        url=vid_versions[0].get("url"),
+                        media_type=MediaType.VIDEO,
+                        content_id=shortcode,
+                        item_id=f"{shortcode}_main",
+                        mime_type="video/mp4",
+                    )
+                )
+                content_type = ContentType.REEL
+            else:
+                img_candidates = item_data.get("image_versions2", {}).get("candidates", [])
+                if img_candidates:
+                    items.append(
+                        InstagramMediaItem(
+                            url=img_candidates[0].get("url"),
+                            media_type=MediaType.PHOTO,
+                            content_id=shortcode,
+                            item_id=f"{shortcode}_main",
+                            mime_type="image/jpeg",
+                        )
+                    )
+                    content_type = ContentType.POST
+                else:
+                    raise InstagramAPIError("No media versions in item data")
+
+        return InstagramContent(
+            content_id=shortcode,
+            original_url=parsed_url.raw_url,
+            canonical_url=parsed_url.canonical_url,
+            content_type=content_type,
+            username=username,
+            caption=caption,
+            items=items,
+            is_authenticated=False,
         )
 
     async def _resolve_via_public_embed(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
@@ -268,11 +415,6 @@ class InstagramClient:
             resp = await client.get(
                 embed_url,
                 headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
                     "Referer": "https://www.instagram.com/",
                 },
             )
@@ -281,21 +423,17 @@ class InstagramClient:
             raise InstagramAPIError(f"Failed to connect to Instagram embed service: {e}") from e
 
         if resp.status_code == 404:
-            raise InstagramContentNotFoundError(
-                "This post has been deleted or does not exist."
-            )
+            raise InstagramContentNotFoundError("This post has been deleted or does not exist.")
 
         html_text = resp.text
 
-        # 1. Check for video stream in embed HTML
-        # Look for video src in <video> tag or embedded JS JSON
+        # 1. Check for video stream
         video_url: Optional[str] = None
         video_match = re.search(r'<video[^>]+src=[\"\']([^\"\']+)[\"\']', html_text)
         if video_match:
             video_url = html.unescape(video_match.group(1))
 
         if not video_url:
-            # Check JSON patterns inside <script>
             json_video = re.search(r'\"video_url\":[\"\']([^\"\']+)[\"\']', html_text)
             if json_video:
                 video_url = json_video.group(1).encode("utf-8").decode("unicode_escape")
@@ -310,7 +448,6 @@ class InstagramClient:
             image_url = html.unescape(img_match.group(1))
 
         if not image_url:
-            # Fallback to og:image meta tag
             og_img = re.search(
                 r'<meta[^>]+property=[\"\']og:image[\"\'][^>]+content=[\"\']([^\"\']+)[\"\']',
                 html_text,
@@ -353,7 +490,6 @@ class InstagramClient:
             re.DOTALL,
         )
         if caption_match:
-            # Strip tags
             raw_caption = re.sub(r'<[^>]+>', '', caption_match.group(1))
             caption_text = html.unescape(raw_caption).strip()
 
@@ -380,7 +516,6 @@ class InstagramClient:
                 )
             )
         else:
-            # If neither video nor image was found, check if it's restricted/private
             raise InstagramPermissionDeniedError(
                 "Cannot resolve media stream for this post. "
                 "The post may be from a private account, age-restricted, or requires login."
