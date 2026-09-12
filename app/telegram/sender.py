@@ -1,4 +1,4 @@
-"""Telegram media delivery handler with size limit enforcement and format routing."""
+"""Telegram media delivery handler with size limit enforcement, format routing, and localization."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.config import Config
+from app.i18n import t
 from app.instagram.models import InstagramContent, InstagramMediaItem, MediaType
 from app.telegram.client import TelegramAPIError, TelegramClient
 
@@ -23,7 +24,7 @@ class TelegramFileSizeError(TelegramDeliveryError):
 
 
 class TelegramMediaSender:
-    """Handles sending downloaded Instagram media to Telegram users."""
+    """Handles sending downloaded Instagram media to Telegram users with bilingual captions."""
 
     MAX_TELEGRAM_BOT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
     MAX_ALBUM_SIZE = 10  # Telegram allows max 10 items per sendMediaGroup
@@ -32,23 +33,27 @@ class TelegramMediaSender:
         self.config = config
         self.client = client
 
-    def format_caption(self, content: InstagramContent, max_length: int = 1024) -> str:
-        """Formats clean, informative caption with source and metadata."""
-        lines = ["<b>Instagram media downloaded successfully</b>\n"]
+    def format_caption(
+        self, content: InstagramContent, max_length: int = 1024, lang: str = "fa"
+    ) -> str:
+        """Formats clean, informative caption with source and metadata in chosen language."""
+        lines = [t("caption_downloaded", lang)]
 
         if content.username:
-            lines.append(f"<b>Source:</b>\n@{html.escape(content.username)}\n")
+            source_lbl = t("caption_source", lang)
+            lines.append(f"{source_lbl}\n@{html.escape(content.username)}\n")
 
         if content.canonical_url:
-            lines.append(f"<b>URL:</b>\n{html.escape(content.canonical_url)}\n")
+            url_lbl = t("caption_url", lang)
+            lines.append(f"{url_lbl}\n{html.escape(content.canonical_url)}\n")
 
         if content.caption:
             clean_caption = content.caption.strip()
-            # Truncate caption if necessary to fit Telegram's 1024 char caption limit
-            remaining = max_length - len("".join(lines)) - 25
+            remaining = max_length - len("".join(lines)) - 35
             if len(clean_caption) > remaining:
                 clean_caption = clean_caption[:max(remaining, 50)] + "..."
-            lines.append(f"<b>Caption:</b>\n{html.escape(clean_caption)}")
+            caption_lbl = t("caption_title", lang)
+            lines.append(f"{caption_lbl}\n{html.escape(clean_caption)}")
 
         return "\n".join(lines).strip()
 
@@ -57,8 +62,9 @@ class TelegramMediaSender:
         chat_id: int | str,
         content: InstagramContent,
         downloaded_items: List[InstagramMediaItem],
+        lang: str = "fa",
     ) -> Dict[str, Any]:
-        """Routes media delivery to sendPhoto, sendVideo, or sendMediaGroup."""
+        """Routes media delivery to sendPhoto, sendVideo, or sendMediaGroup with localization."""
         if not downloaded_items:
             raise TelegramDeliveryError("No downloaded media items available to send")
 
@@ -68,17 +74,17 @@ class TelegramMediaSender:
                 raise TelegramDeliveryError(f"Media file not found on disk: {item.item_id}")
             size = item.file_size_bytes or item.file_path.stat().st_size
             if size > self.MAX_TELEGRAM_BOT_FILE_SIZE:
-                err_msg = (
-                    f"⚠️ <b>File Size Limit Exceeded</b>\n\n"
-                    f"The requested media file ({size / (1024 * 1024):.1f} MB) exceeds Telegram's "
-                    f"bot upload limit of 50 MB.\n\n"
-                    f"<b>Direct link:</b> {content.canonical_url}"
+                err_msg = t(
+                    "err_file_size",
+                    lang,
+                    size=size / (1024 * 1024),
+                    url=content.canonical_url,
                 )
                 await self.client.send_message(chat_id, err_msg)
                 raise TelegramFileSizeError(f"File {item.file_path.name} exceeds 50MB Telegram limit")
 
-        caption = self.format_caption(content)
-        logger.info("Delivering %d media item(s) to Telegram chat %s", len(downloaded_items), chat_id)
+        caption = self.format_caption(content, lang=lang)
+        logger.info("Delivering %d media item(s) to Telegram chat %s (lang: %s)", len(downloaded_items), chat_id, lang)
 
         # 2. Single item delivery
         if len(downloaded_items) == 1:
@@ -97,7 +103,6 @@ class TelegramMediaSender:
                 )
 
         # 3. Carousel / Multi-item delivery (sendMediaGroup)
-        # Split into chunks of 10 if necessary
         chunks = [
             downloaded_items[i : i + self.MAX_ALBUM_SIZE]
             for i in range(0, len(downloaded_items), self.MAX_ALBUM_SIZE)
@@ -117,7 +122,6 @@ class TelegramMediaSender:
                     "type": mtype,
                     "media": f"attach://{attach_id}",
                 }
-                # Caption only on the first item of the first album
                 if chunk_idx == 0 and idx == 0:
                     media_entry["caption"] = caption
                     media_entry["parse_mode"] = "HTML"

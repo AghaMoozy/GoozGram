@@ -1,4 +1,4 @@
-"""End-to-end media processing pipeline and duplicate prevention orchestrator."""
+"""End-to-end media processing pipeline and duplicate prevention orchestrator with localization."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import List, Optional
 from app.config import Config
 from app.database.models import DeliveryStatus, MediaRecord, MediaStatus
 from app.database.repository import MediaRepository
+from app.i18n import t
 from app.instagram.client import (
     InstagramAuthenticationError,
     InstagramClient,
@@ -74,18 +75,23 @@ class MediaService:
         raw_url: str,
         chat_id: int,
         force_retry: bool = False,
+        user_id: Optional[int] = None,
     ) -> ProcessResult:
         """Executes the complete asynchronous pipeline for a single Instagram URL under concurrency control."""
         async with self._concurrency_semaphore:
-            return await self._process_url_internal(raw_url, chat_id, force_retry)
+            return await self._process_url_internal(raw_url, chat_id, force_retry, user_id)
 
     async def _process_url_internal(
         self,
         raw_url: str,
         chat_id: int,
         force_retry: bool = False,
+        user_id: Optional[int] = None,
     ) -> ProcessResult:
         logger.info("Instagram request received: %s from chat %s", raw_url, chat_id)
+
+        uid = user_id or chat_id
+        lang = (await self.repository.get_user_language(uid)) or "fa"
 
         # 1. URL Validation & Parsing
         try:
@@ -93,16 +99,14 @@ class MediaService:
         except InvalidInstagramURLError as e:
             logger.warning("Invalid Instagram URL: %s (%s)", raw_url, e)
             safe_err = html.escape(str(e))
-            await self._notify_user_error(chat_id, f"❌ <b>Invalid Instagram URL</b>\n\n{safe_err}")
+            msg = t("err_invalid_url", lang, err=safe_err)
+            await self._notify_user_error(chat_id, msg)
             return ProcessResult(success=False, content_id="", message=str(e))
         except UnsupportedInstagramURLError as e:
             logger.warning("Unsupported Instagram URL: %s (%s)", raw_url, e)
             safe_err = html.escape(str(e))
-            await self._notify_user_error(
-                chat_id,
-                f"⚠️ <b>Unsupported Instagram Link</b>\n\n{safe_err}\n\n"
-                f"Supported: Posts, Reels, Carousels, and Stories.",
-            )
+            msg = t("err_unsupported_url", lang, err=safe_err)
+            await self._notify_user_error(chat_id, msg)
             return ProcessResult(success=False, content_id="", message=str(e))
 
         content_id = parsed_url.content_id
@@ -119,8 +123,7 @@ class MediaService:
                     logger.info("Duplicate request for %s already SENT.", content_id)
                     await self.telegram_client.send_message(
                         chat_id,
-                        f"ℹ️ <b>Already Processed</b>\n\n"
-                        f"This Instagram media (<code>{safe_content_id}</code>) was already downloaded and sent to you.",
+                        t("already_processed", lang, content_id=safe_content_id),
                     )
                     return ProcessResult(
                         success=True,
@@ -132,8 +135,7 @@ class MediaService:
                     logger.info("Media %s is currently being downloaded.", content_id)
                     await self.telegram_client.send_message(
                         chat_id,
-                        f"⏳ <b>In Progress</b>\n\n"
-                        f"This media is currently being downloaded. Please wait a moment...",
+                        t("in_progress", lang),
                     )
                     return ProcessResult(
                         success=False,
@@ -158,7 +160,7 @@ class MediaService:
             try:
                 status_msg = await self.telegram_client.send_message(
                     chat_id,
-                    f"🔍 Resolving media for <code>{safe_content_id}</code>...",
+                    t("resolving_media", lang, content_id=safe_content_id),
                 )
                 status_msg_id = status_msg.get("message_id")
             except Exception as e:
@@ -185,12 +187,13 @@ class MediaService:
 
             await self.repository.update_status(record.id, MediaStatus.DOWNLOADED)
 
-            # 5. Telegram Media Delivery
-            logger.info("Telegram delivery started for %s", content_id)
+            # 5. Telegram Media Delivery with user language
+            logger.info("Telegram delivery started for %s (lang: %s)", content_id, lang)
             delivery_res = await self.sender.send_media(
                 chat_id=chat_id,
                 content=content,
                 downloaded_items=downloaded_items,
+                lang=lang,
             )
             logger.info("Telegram delivery completed for %s", content_id)
 
@@ -214,26 +217,20 @@ class MediaService:
             )
 
         except (InstagramContentNotFoundError, InstagramContentExpiredError) as e:
-            safe_e = html.escape(str(e))
-            err = f"❌ <b>Content Unavailable</b>\n\n{safe_e}"
+            err = t("err_content_unavailable", lang)
             rec_id = record.id if record else None
             await self._handle_failure(rec_id, chat_id, err, str(e))
             return ProcessResult(success=False, content_id=content_id, message=str(e), record=record)
 
         except (InstagramAuthenticationError, InstagramPermissionDeniedError) as e:
-            safe_e = html.escape(str(e))
-            err = (
-                f"🔒 <b>Authentication / Permission Required</b>\n\n"
-                f"{safe_e}\n\n"
-                f"Private posts or restricted stories require authorized access."
-            )
+            err = t("err_private_account", lang)
             rec_id = record.id if record else None
             await self._handle_failure(rec_id, chat_id, err, str(e))
             return ProcessResult(success=False, content_id=content_id, message=str(e), record=record)
 
         except InstagramRateLimitError as e:
             safe_e = html.escape(str(e))
-            err = f"⏳ <b>Instagram Rate Limit</b>\n\n{safe_e}\nPlease try again in a few minutes."
+            err = f"⏳ <b>Rate Limit</b>\n\n{safe_e}"
             rec_id = record.id if record else None
             await self._handle_failure(rec_id, chat_id, err, str(e))
             return ProcessResult(success=False, content_id=content_id, message=str(e), record=record)
@@ -254,7 +251,7 @@ class MediaService:
 
         except (DownloadError, CorruptMediaError) as e:
             safe_e = html.escape(str(e))
-            err = f"❌ <b>Download Error</b>\n\nFailed to download media stream: {safe_e}"
+            err = f"❌ <b>Download Error</b>\n\n{safe_e}"
             rec_id = record.id if record else None
             await self._handle_failure(rec_id, chat_id, err, str(e))
             return ProcessResult(success=False, content_id=content_id, message=str(e), record=record)
@@ -269,7 +266,7 @@ class MediaService:
         except Exception as e:
             logger.exception("Unexpected error processing %s: %s", content_id, e)
             safe_e = html.escape(str(e))
-            err = f"⚠️ <b>System Error</b>\n\nAn unexpected error occurred: {safe_e}"
+            err = f"⚠️ <b>System Error</b>\n\n{safe_e}"
             rec_id = record.id if record else None
             await self._handle_failure(rec_id, chat_id, err, str(e))
             return ProcessResult(success=False, content_id=content_id, message=str(e), record=record)

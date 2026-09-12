@@ -64,7 +64,7 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
         self.commands = CommandHandlers(self.cfg, self.mock_tg_client, self.repo)
         self.messages = MessageHandlers(self.mock_tg_client, self.media_service, self.commands)
         self.auth = AuthorizationMiddleware(self.cfg)
-        self.bot = TelegramBot(self.cfg, self.mock_tg_client, self.auth, self.commands, self.messages)
+        self.bot = TelegramBot(self.cfg, self.mock_tg_client, self.auth, self.commands, self.messages, repository=self.repo)
 
     async def asyncTearDown(self):
         await self.ig_client.close()
@@ -93,7 +93,7 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(record)
 
     async def test_authorized_user_command_flow(self):
-        """Simulates an authorized user sending /start and /status."""
+        """Simulates first-time start (language selection) and status flow."""
         start_update = {
             "update_id": 2,
             "message": {
@@ -104,11 +104,27 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
             },
         }
         await self.bot._dispatch_update(start_update)
-        call_args = self.mock_tg_client.send_message.call_args; sent_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
-        self.assertIn("Welcome to your Personal Instagram Downloader", sent_text)
+        call_args = self.mock_tg_client.send_message.call_args
+        sent_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
+        self.assertIn("لطفاً زبان", sent_text)
 
-        status_update = {
+        # User chooses English
+        cb_update = {
             "update_id": 3,
+            "callback_query": {
+                "id": "cb_1",
+                "from": {"id": 1001, "first_name": "Alireza"},
+                "message": {"chat": {"id": 1001}, "message_id": 51},
+                "data": "lang:en",
+            }
+        }
+        await self.bot._dispatch_update(cb_update)
+        lang = await self.repo.get_user_language(1001)
+        self.assertEqual(lang, "en")
+
+        # Status command in English
+        status_update = {
+            "update_id": 4,
             "message": {
                 "message_id": 52,
                 "chat": {"id": 1001},
@@ -117,7 +133,8 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
             },
         }
         await self.bot._dispatch_update(status_update)
-        call_args = self.mock_tg_client.send_message.call_args; status_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
+        call_args = self.mock_tg_client.send_message.call_args
+        status_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
         self.assertIn("Bot Status & Statistics", status_text)
 
     async def test_carousel_split_over_ten_items(self):

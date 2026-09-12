@@ -1,4 +1,4 @@
-"""Asynchronous Telegram Bot runner and update dispatcher."""
+"""Asynchronous Telegram Bot runner and update dispatcher with language callbacks."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ from typing import Any, Dict, Optional
 
 from app.bot.handlers.commands import CommandHandlers
 from app.bot.handlers.messages import MessageHandlers
+from app.bot.keyboards.menu import get_language_inline_keyboard, get_main_reply_keyboard
 from app.bot.middlewares.auth import AuthorizationMiddleware
 from app.config import Config
+from app.database.repository import MediaRepository
+from app.i18n import t
 from app.telegram.client import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -25,12 +28,14 @@ class TelegramBot:
         auth_middleware: AuthorizationMiddleware,
         command_handlers: CommandHandlers,
         message_handlers: MessageHandlers,
+        repository: Optional[MediaRepository] = None,
     ) -> None:
         self.config = config
         self.client = telegram_client
         self.auth = auth_middleware
         self.commands = command_handlers
         self.messages = message_handlers
+        self.repository = repository
         self._running = False
         self._last_update_id: Optional[int] = None
 
@@ -89,16 +94,45 @@ class TelegramBot:
             # Authorized message handling
             await self.messages.handle_message(message)
 
-        # 2. Callback query update (inline buttons)
+        # 2. Callback query update (inline buttons & language switcher)
         elif "callback_query" in update:
             cb = update["callback_query"]
             user = cb.get("from", {})
             user_id = user.get("id")
             chat_id = cb.get("message", {}).get("chat", {}).get("id")
-            data = cb.get("data")
+            data = cb.get("data", "")
 
             if not self.auth.is_authorized(user_id):
                 return
 
+            # Language selection callback
+            if data.startswith("lang:") and chat_id and user_id:
+                choice = data.split(":")[1]
+                if self.repository:
+                    await self.repository.set_user_language(user_id, choice)
+
+                # Send confirmation with updated persistent reply keyboard
+                conf_msg = t("lang_changed", choice)
+                await self.client.send_message(
+                    chat_id=chat_id,
+                    text=conf_msg,
+                    reply_markup=get_main_reply_keyboard(choice),
+                )
+                # Show welcome message in new language
+                first_name = user.get("first_name", "")
+                await self.commands.handle_start(chat_id, user_id=user_id, user_name=first_name)
+                return
+
+            # Request to change language from Settings menu
+            if data == "change_lang" and chat_id and user_id:
+                lang = (await self.repository.get_user_language(user_id)) if self.repository else "fa"
+                prompt_text = t("choose_language_prompt", lang or "fa")
+                await self.client.send_message(
+                    chat_id=chat_id,
+                    text=prompt_text,
+                    reply_markup=get_language_inline_keyboard(),
+                )
+                return
+
             if data == "refresh_status" and chat_id:
-                await self.commands.handle_status(chat_id)
+                await self.commands.handle_status(chat_id, user_id=user_id)

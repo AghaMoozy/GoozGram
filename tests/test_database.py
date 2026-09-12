@@ -73,3 +73,19 @@ class TestDatabaseRepository(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    async def test_language_persistence(self):
+        # Default should be None
+        lang = await self.repo.get_user_language(123456)
+        self.assertIsNone(lang)
+
+        # Set to Persian
+        await self.repo.set_user_language(123456, "fa")
+        lang = await self.repo.get_user_language(123456)
+        self.assertEqual(lang, "fa")
+
+        # Update to English
+        await self.repo.set_user_language(123456, "en")
+        lang = await self.repo.get_user_language(123456)
+        self.assertEqual(lang, "en")

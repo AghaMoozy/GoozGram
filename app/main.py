@@ -211,9 +211,9 @@ async def main() -> None:
 
     # 4. Telegram Bot Handlers
     commands = CommandHandlers(config, telegram_client, repository)
-    messages = MessageHandlers(telegram_client, media_service, commands)
+    messages = MessageHandlers(telegram_client, media_service, commands, repository=repository)
     auth_middleware = AuthorizationMiddleware(config)
-    bot = TelegramBot(config, telegram_client, auth_middleware, commands, messages)
+    bot = TelegramBot(config, telegram_client, auth_middleware, commands, messages, repository=repository)
 
     # 5. Instagram DM Webhook integration callback
     async def on_instagram_dm_url(url: str, sender_id: Optional[str]) -> None:

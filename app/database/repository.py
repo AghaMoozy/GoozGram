@@ -238,3 +238,55 @@ class MediaRepository:
                 }
 
         return await asyncio.to_thread(_stats)
+
+
+    async def get_user_language(self, user_id: int) -> Optional[str]:
+        """Gets user selected language ('fa' or 'en'), or None if never chosen."""
+        def _get():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id INTEGER PRIMARY KEY,
+                        language TEXT NOT NULL DEFAULT 'fa',
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                cursor.execute(
+                    "SELECT language FROM user_settings WHERE user_id = ?",
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                return row["language"] if row else None
+
+        return await asyncio.to_thread(_get)
+
+    async def set_user_language(self, user_id: int, language: str) -> None:
+        """Saves user preferred language."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        clean_lang = "fa" if language.lower().startswith("fa") else "en"
+
+        def _set():
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id INTEGER PRIMARY KEY,
+                        language TEXT NOT NULL DEFAULT 'fa',
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                cursor.execute(
+                    """
+                    INSERT INTO user_settings (user_id, language, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        language = excluded.language,
+                        updated_at = excluded.updated_at
+                    """,
+                    (user_id, clean_lang, now_iso),
+                )
+                conn.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_set)
