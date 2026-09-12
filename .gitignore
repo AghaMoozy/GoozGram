@@ -1,27 +1,96 @@
-# Environment & Secrets
+# ==============================================================================
+# 1. Environment Variables & Secrets (CRITICAL FOR BOT & ACCOUNT SECURITY)
+# ==============================================================================
+# Local secrets and config containing Telegram bot tokens & Meta API keys
 .env
 .env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Always track the example template file
 !.env.example
+
+# SSL/TLS Certificates and Private Keys
 *.pem
 *.key
 *.cert
-*.token
-credentials.json
-session.json
+*.crt
+*.pfx
+*.p12
 
-# Python & Virtualenv
+# Credentials, API tokens, and session stores
+credentials.json
+client_secret*.json
+token.json
+*.token
+session.json
+*.session
+*.session-journal
+cookies.txt
+*.cookies
+*.cookie
+
+# ==============================================================================
+# 2. Application Runtime Data & Database (SQLite)
+# ==============================================================================
+# Ignore all SQLite databases and runtime files in the data directory
+data/*
+!data/.gitkeep
+
+# Root and recursive SQLite files
+*.db
+*.sqlite
+*.sqlite3
+
+# SQLite WAL (Write-Ahead Logging) and rollback journal files
+*.db-journal
+*.sqlite-journal
+*.db-wal
+*.sqlite-wal
+*.db-shm
+*.sqlite-shm
+
+# ==============================================================================
+# 3. Temporary Download Storage & Media Cache
+# ==============================================================================
+# Keep the folder structure in Git via .gitkeep but ignore all downloaded media
+downloads/*
+!downloads/.gitkeep
+
+# Catch media files if downloaded outside downloads/
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.webm
+*.part
+*.crdownload
+*.tmp
+
+# ==============================================================================
+# 4. Python Environment, Bytecode & Build Artifacts
+# ==============================================================================
+# Bytecode and runtime cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
+
+# Virtual environments
 venv/
+env/
 .venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Packaging, builds, and distribution
 build/
 develop-eggs/
 dist/
-downloads/
 eggs/
 .eggs/
 lib/
@@ -33,27 +102,65 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+pip-wheel-metadata/
 
-# Databases & Runtime Data
-data/
-*.db
-*.sqlite
-*.sqlite3
+# ==============================================================================
+# 5. Testing, Code Quality & Linters
+# ==============================================================================
+# Test runner and coverage caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.nox/
 
-# Downloads & Temp storage
-downloads/*
-!downloads/.gitkeep
+# Type checking and linter caches
+.mypy_cache/
+.ruff_cache/
+dmypy.json
 
-# IDEs & Editors
-.vscode/
+# ==============================================================================
+# 6. Docker & Container Overrides
+# ==============================================================================
+docker-compose.override.yml
+docker-compose.override.yaml
+.docker/
+
+# ==============================================================================
+# 7. Logs & Process Monitoring
+# ==============================================================================
+*.log
+logs/
+nohup.out
+
+# ==============================================================================
+# 8. Operating System & Editor Metadata
+# ==============================================================================
+# IDEs
 .idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Testing & Coverage
-.pytest_cache/
-.coverage
-htmlcov/
-*.log
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.fuse_hidden*
