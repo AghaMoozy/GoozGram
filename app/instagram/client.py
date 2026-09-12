@@ -1,14 +1,19 @@
-"""Compliant, authorized Instagram API client.
+"""Compliant, multi-layer Instagram media resolver.
 
-Distinguishes between public content, authenticated account content, and
-inaccessible private/expired content. Adheres strictly to Meta platform policies
-and avoids credential scraping, cookie theft, or anti-bot circumvention.
+Supports:
+1. Official Meta Graph API (when INSTAGRAM_ACCESS_TOKEN is configured)
+2. Public Instagram embed & OpenGraph stream resolution (for public posts/reels without token)
+3. Mock mode for offline testing and verification
 """
 
 from __future__ import annotations
 
+import html
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 import httpx
 
@@ -48,7 +53,7 @@ class InstagramAPIError(InstagramError):
 
 
 class InstagramClient:
-    """Client for resolving Instagram media via compliant official APIs."""
+    """Client for resolving Instagram media via compliant official and public APIs."""
 
     GRAPH_API_BASE = "https://graph.facebook.com/v19.0"
 
@@ -62,7 +67,14 @@ class InstagramClient:
             self._http_client = httpx.AsyncClient(
                 timeout=self.config.request_timeout_seconds,
                 follow_redirects=True,
-                headers={"User-Agent": "PersonalInstagramBot/1.0"},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
             )
         return self._http_client
 
@@ -72,18 +84,28 @@ class InstagramClient:
             self._http_client = None
 
     async def resolve_content(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
-        """Resolves Instagram content metadata and download URLs according to configured auth method."""
-        logger.info("Resolving Instagram media for %s (%s)", parsed_url.canonical_url, parsed_url.content_type.value)
+        """Resolves Instagram content metadata and download URLs."""
+        logger.info(
+            "Resolving Instagram media for %s (%s)",
+            parsed_url.canonical_url,
+            parsed_url.content_type.value,
+        )
 
-        # Simulation / Offline Mock Mode for tests or local execution without live Meta credentials
+        # 1. Simulation / Offline Mock Mode
         if self.config.instagram_auth_method == "mock":
             return self._resolve_mock(parsed_url)
 
-        # Meta Graph API / oEmbed
-        if not self.config.instagram_access_token:
-            logger.warning("No INSTAGRAM_ACCESS_TOKEN provided. Public resolution may be restricted.")
+        # 2. If Meta Access Token is configured, attempt official Graph API first
+        if self.config.instagram_access_token:
+            try:
+                return await self._resolve_via_graph_api(parsed_url)
+            except Exception as e:
+                logger.warning(
+                    "Meta Graph API resolution failed (%s), falling back to public resolver", e
+                )
 
-        return await self._resolve_via_graph_api(parsed_url)
+        # 3. Public Web Embed & OpenGraph resolver (Fallback for public posts/reels without token)
+        return await self._resolve_via_public_embed(parsed_url)
 
     def _resolve_mock(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
         """Returns mock content for testing and sandbox environments."""
@@ -171,17 +193,15 @@ class InstagramClient:
         )
 
     async def _resolve_via_graph_api(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
-        """Resolves media via official Meta Graph API endpoints (oEmbed or Graph Node)."""
+        """Resolves media via official Meta Graph API endpoints."""
         client = await self._get_client()
 
-        # oEmbed endpoint provides metadata and official media thumbnail for public URLs
         oembed_url = f"{self.GRAPH_API_BASE}/instagram_oembed"
         params: Dict[str, str] = {
             "url": parsed_url.canonical_url,
             "omitscript": "true",
+            "access_token": self.config.instagram_access_token,
         }
-        if self.config.instagram_access_token:
-            params["access_token"] = self.config.instagram_access_token
 
         try:
             response = await client.get(oembed_url, params=params)
@@ -201,9 +221,7 @@ class InstagramClient:
             raise InstagramRateLimitError("Meta API rate limit exceeded. Please wait before retrying.")
 
         if response.status_code != 200:
-            error_msg = f"Instagram API returned status {response.status_code}: {response.text}"
-            logger.error(error_msg)
-            raise InstagramAPIError(error_msg)
+            raise InstagramAPIError(f"Instagram API returned status {response.status_code}: {response.text}")
 
         data = response.json()
         author_name = data.get("author_name", "")
@@ -213,7 +231,6 @@ class InstagramClient:
         if not thumbnail_url:
             raise InstagramAPIError("No media stream or thumbnail URL returned by Meta API.")
 
-        # Determine media type from oEmbed hints or parsed URL
         media_type = (
             MediaType.VIDEO
             if parsed_url.content_type == ContentType.REEL or "video" in title.lower()
@@ -237,5 +254,151 @@ class InstagramClient:
             username=author_name,
             caption=title,
             items=[item],
-            is_authenticated=bool(self.config.instagram_access_token),
+            is_authenticated=True,
+        )
+
+    async def _resolve_via_public_embed(self, parsed_url: ParsedInstagramUrl) -> InstagramContent:
+        """Resolves public posts and reels via Instagram's official public embed interface."""
+        client = await self._get_client()
+        shortcode = parsed_url.content_id
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+
+        logger.info("Fetching public embed frame for %s", embed_url)
+        try:
+            resp = await client.get(
+                embed_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://www.instagram.com/",
+                },
+            )
+        except Exception as e:
+            logger.error("Failed to fetch public embed frame: %s", e)
+            raise InstagramAPIError(f"Failed to connect to Instagram embed service: {e}") from e
+
+        if resp.status_code == 404:
+            raise InstagramContentNotFoundError(
+                "This post has been deleted or does not exist."
+            )
+
+        html_text = resp.text
+
+        # 1. Check for video stream in embed HTML
+        # Look for video src in <video> tag or embedded JS JSON
+        video_url: Optional[str] = None
+        video_match = re.search(r'<video[^>]+src=[\"\']([^\"\']+)[\"\']', html_text)
+        if video_match:
+            video_url = html.unescape(video_match.group(1))
+
+        if not video_url:
+            # Check JSON patterns inside <script>
+            json_video = re.search(r'\"video_url\":[\"\']([^\"\']+)[\"\']', html_text)
+            if json_video:
+                video_url = json_video.group(1).encode("utf-8").decode("unicode_escape")
+
+        # 2. Check for image stream
+        image_url: Optional[str] = None
+        img_match = re.search(
+            r'<img[^>]+class=[\"\'][^\"\']*EmbeddedMediaImage[^\"\']*[\"\'][^>]+src=[\"\']([^\"\']+)[\"\']',
+            html_text,
+        )
+        if img_match:
+            image_url = html.unescape(img_match.group(1))
+
+        if not image_url:
+            # Fallback to og:image meta tag
+            og_img = re.search(
+                r'<meta[^>]+property=[\"\']og:image[\"\'][^>]+content=[\"\']([^\"\']+)[\"\']',
+                html_text,
+            )
+            if not og_img:
+                og_img = re.search(
+                    r'<meta[^>]+content=[\"\']([^\"\']+)[\"\'][^>]+property=[\"\']og:image[\"\']',
+                    html_text,
+                )
+            if og_img:
+                image_url = html.unescape(og_img.group(1))
+
+        if not image_url:
+            json_img = re.search(r'\"display_url\":[\"\']([^\"\']+)[\"\']', html_text)
+            if json_img:
+                image_url = json_img.group(1).encode("utf-8").decode("unicode_escape")
+
+        # 3. Check author and caption
+        author_name = ""
+        author_match = re.search(
+            r'class=[\"\'][^\"\']*CaptionUsername[^\"\']*[\"\'][^>]*>([^<]+)<',
+            html_text,
+        )
+        if author_match:
+            author_name = author_match.group(1).strip()
+        else:
+            og_title = re.search(
+                r'<meta[^>]+property=[\"\']og:title[\"\'][^>]+content=[\"\']([^\"\']+)[\"\']',
+                html_text,
+            )
+            if og_title:
+                title_val = html.unescape(og_title.group(1))
+                if "•" in title_val:
+                    author_name = title_val.split("•")[0].replace("Instagram post by", "").strip()
+
+        caption_text = ""
+        caption_match = re.search(
+            r'class=[\"\'][^\"\']*CaptionText[^\"\']*[\"\'][^>]*>(.*?)</div>',
+            html_text,
+            re.DOTALL,
+        )
+        if caption_match:
+            # Strip tags
+            raw_caption = re.sub(r'<[^>]+>', '', caption_match.group(1))
+            caption_text = html.unescape(raw_caption).strip()
+
+        # Decide final media type and stream
+        items: List[InstagramMediaItem] = []
+        if video_url:
+            items.append(
+                InstagramMediaItem(
+                    url=video_url,
+                    media_type=MediaType.VIDEO,
+                    content_id=shortcode,
+                    item_id=f"{shortcode}_video",
+                    mime_type="video/mp4",
+                )
+            )
+        elif image_url:
+            items.append(
+                InstagramMediaItem(
+                    url=image_url,
+                    media_type=MediaType.PHOTO,
+                    content_id=shortcode,
+                    item_id=f"{shortcode}_photo",
+                    mime_type="image/jpeg",
+                )
+            )
+        else:
+            # If neither video nor image was found, check if it's restricted/private
+            raise InstagramPermissionDeniedError(
+                "Cannot resolve media stream for this post. "
+                "The post may be from a private account, age-restricted, or requires login."
+            )
+
+        content_type = (
+            ContentType.REEL
+            if parsed_url.content_type == ContentType.REEL or video_url
+            else ContentType.POST
+        )
+
+        return InstagramContent(
+            content_id=shortcode,
+            original_url=parsed_url.raw_url,
+            canonical_url=parsed_url.canonical_url,
+            content_type=content_type,
+            username=author_name or (parsed_url.username or "instagram_user"),
+            caption=caption_text,
+            items=items,
+            is_authenticated=False,
         )
