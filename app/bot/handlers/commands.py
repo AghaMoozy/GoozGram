@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import Any, Dict
 
@@ -27,7 +28,8 @@ class CommandHandlers:
         self.repository = repository
 
     async def handle_start(self, chat_id: int, user_name: str = "") -> None:
-        greeting = f", <b>{user_name}</b>" if user_name else ""
+        clean_name = html.escape(user_name)
+        greeting = f", <b>{clean_name}</b>" if clean_name else ""
         text = (
             f"👋 <b>Welcome to your Personal Instagram Downloader{greeting}!</b>\n\n"
             "This bot is configured for your private, authorized use.\n\n"
@@ -88,26 +90,27 @@ class CommandHandlers:
             f"• <b>Ready for Delivery:</b> {downloaded}\n"
             f"• <b>Failed Requests:</b> {failed} ❌\n\n"
             f"• <b>Storage Mode:</b> {'Keep files' if self.config.keep_downloads else 'Auto-cleanup (Secure)'}\n"
-            f"• <b>Download Folder:</b> <code>{self.config.download_dir.name}/</code>"
+            f"• <b>Download Folder:</b> <code>{html.escape(self.config.download_dir.name)}/</code>"
         )
         await self.client.send_message(chat_id=chat_id, text=text)
 
     async def handle_settings(self, chat_id: int) -> None:
         auth_count = len(self.config.authorized_telegram_user_ids)
         max_size_mb = self.config.max_download_size_bytes / (1024 * 1024)
-        db_file = self.config.get_sqlite_path()
+        db_file = html.escape(self.config.get_sqlite_path())
+        account = html.escape(self.config.instagram_account or "Not specified")
 
         text = (
             "⚙️ <b>Current System Configuration</b>\n\n"
             f"• <b>Authorized Telegram Users:</b> {auth_count} user(s)\n"
-            f"• <b>Instagram Account:</b> <code>{self.config.instagram_account or 'Not specified'}</code>\n"
-            f"• <b>Instagram Auth Method:</b> <code>{self.config.instagram_auth_method}</code>\n"
+            f"• <b>Instagram Account:</b> <code>{account}</code>\n"
+            f"• <b>Instagram Auth Method:</b> <code>{html.escape(self.config.instagram_auth_method)}</code>\n"
             f"• <b>Access Token:</b> {'Configured' if self.config.instagram_access_token else 'None (Public/oEmbed mode)'}\n"
             f"• <b>Max File Size:</b> {max_size_mb:.1f} MB\n"
             f"• <b>Auto Cleanup:</b> {'Disabled' if self.config.keep_downloads else 'Enabled (Immediate deletion)'}\n"
             f"• <b>Max Retries:</b> {self.config.max_retries}\n"
             f"• <b>Database:</b> <code>{db_file}</code>\n"
-            f"• <b>Log Level:</b> <code>{self.config.log_level}</code>"
+            f"• <b>Log Level:</b> <code>{html.escape(self.config.log_level)}</code>"
         )
         await self.client.send_message(
             chat_id=chat_id,

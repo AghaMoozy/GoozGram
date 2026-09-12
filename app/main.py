@@ -32,7 +32,10 @@ logger = logging.getLogger("app.main")
 
 
 class WebhookServer:
-    """Lightweight asynchronous HTTP server for Meta Webhooks."""
+    """Hardened, lightweight asynchronous HTTP server for Meta Webhooks."""
+
+    MAX_WEBHOOK_PAYLOAD_SIZE = 1 * 1024 * 1024  # 1 MB maximum payload defense
+    SOCKET_TIMEOUT = 15.0  # 15 seconds slowloris defense timeout
 
     def __init__(self, config: Config, webhook_handler: InstagramWebhookHandler) -> None:
         self.config = config
@@ -58,32 +61,53 @@ class WebhookServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            line = await reader.readline()
+            # Read request line with timeout
+            line = await asyncio.wait_for(reader.readline(), timeout=self.SOCKET_TIMEOUT)
             if not line:
                 writer.close()
                 return
 
-            request_line = line.decode("utf-8").strip()
+            request_line = line.decode("utf-8", errors="replace").strip()
             parts = request_line.split(" ")
             if len(parts) < 2:
                 writer.close()
                 return
 
-            method, path = parts[0], parts[1]
+            method, path = parts[0].upper(), parts[1]
 
-            # Read headers
+            # Read headers with timeout and limit header size
             headers = {}
+            header_bytes_count = 0
             while True:
-                header_line = await reader.readline()
+                header_line = await asyncio.wait_for(reader.readline(), timeout=self.SOCKET_TIMEOUT)
                 if not header_line or header_line == b"\r\n":
                     break
-                header_str = header_line.decode("utf-8").strip()
+                header_bytes_count += len(header_line)
+                if header_bytes_count > 16384:  # 16 KB max headers
+                    self._send_response(writer, 431, "text/plain", b"Request Header Fields Too Large")
+                    return
+
+                header_str = header_line.decode("utf-8", errors="replace").strip()
                 if ":" in header_str:
                     k, v = header_str.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
-            content_length = int(headers.get("content-length", 0))
-            body = await reader.readexactly(content_length) if content_length > 0 else b""
+            # Content length parsing & validation
+            try:
+                content_length = int(headers.get("content-length", 0))
+            except ValueError:
+                self._send_response(writer, 400, "text/plain", b"Invalid Content-Length")
+                return
+
+            if content_length < 0 or content_length > self.MAX_WEBHOOK_PAYLOAD_SIZE:
+                self._send_response(writer, 413, "text/plain", b"Payload Too Large")
+                return
+
+            body = (
+                await asyncio.wait_for(reader.readexactly(content_length), timeout=self.SOCKET_TIMEOUT)
+                if content_length > 0
+                else b""
+            )
 
             # Route: GET /health
             if method == "GET" and path == "/health":
@@ -104,8 +128,8 @@ class WebhookServer:
             if method == "POST" and "/webhook/instagram" in path:
                 sig = headers.get("x-hub-signature-256", "")
                 if not self.handler.verify_signature(body, sig):
-                    logger.warning("Rejected webhook POST with invalid signature")
-                    self._send_response(writer, 401, "text/plain", b"Invalid signature")
+                    logger.warning("Rejected webhook POST: signature check failed")
+                    self._send_response(writer, 401, "text/plain", b"Unauthorized")
                     return
 
                 # Process payload asynchronously
@@ -116,6 +140,8 @@ class WebhookServer:
             # 404 for other routes
             self._send_response(writer, 404, "text/plain", b"Not Found")
 
+        except asyncio.TimeoutError:
+            logger.debug("Webhook client connection timed out (slowloris protection)")
         except Exception as e:
             logger.error("Error handling webhook request: %s", e)
         finally:
@@ -128,7 +154,17 @@ class WebhookServer:
     def _send_response(
         self, writer: asyncio.StreamWriter, status: int, content_type: str, body: bytes
     ) -> None:
-        status_text = "OK" if status == 200 else ("Not Found" if status == 404 else "Error")
+        status_map = {
+            200: "OK",
+            400: "Bad Request",
+            401: "Unauthorized",
+            403: "Forbidden",
+            404: "Not Found",
+            413: "Payload Too Large",
+            431: "Request Header Fields Too Large",
+            500: "Internal Server Error",
+        }
+        status_text = status_map.get(status, "Response")
         res = (
             f"HTTP/1.1 {status} {status_text}\r\n"
             f"Content-Type: {content_type}\r\n"

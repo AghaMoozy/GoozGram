@@ -85,7 +85,7 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
         await self.bot._dispatch_update(update)
 
         self.mock_tg_client.send_message.assert_awaited_once()
-        sent_text = self.mock_tg_client.send_message.call_args[0][1]
+        call_args = self.mock_tg_client.send_message.call_args; sent_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
         self.assertIn("Access Denied", sent_text)
 
         # Database should have no record created
@@ -104,7 +104,7 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
             },
         }
         await self.bot._dispatch_update(start_update)
-        sent_text = self.mock_tg_client.send_message.call_args[0][1]
+        call_args = self.mock_tg_client.send_message.call_args; sent_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
         self.assertIn("Welcome to your Personal Instagram Downloader", sent_text)
 
         status_update = {
@@ -117,7 +117,7 @@ class TestIntegrationFlow(unittest.IsolatedAsyncioTestCase):
             },
         }
         await self.bot._dispatch_update(status_update)
-        status_text = self.mock_tg_client.send_message.call_args[0][1]
+        call_args = self.mock_tg_client.send_message.call_args; status_text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
         self.assertIn("Bot Status & Statistics", status_text)
 
     async def test_carousel_split_over_ten_items(self):

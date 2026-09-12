@@ -1,13 +1,15 @@
-"""Asynchronous, streaming media downloader with size validation and file integrity checks."""
+"""Asynchronous, streaming media downloader with size validation, SSRF defense, and file integrity checks."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -21,6 +23,10 @@ class DownloadError(Exception):
     """Base error for media download operations."""
 
 
+class SSRFSecurityError(DownloadError):
+    """Raised when media URL points to loopback, private, or unauthorized address."""
+
+
 class FileSizeExceededError(DownloadError):
     """Raised when downloaded media exceeds Telegram limits or configuration bounds."""
 
@@ -30,7 +36,7 @@ class CorruptMediaError(DownloadError):
 
 
 class MediaDownloader:
-    """Downloads media files safely with size enforcement and format validation."""
+    """Downloads media files safely with size enforcement, SSRF prevention, and format validation."""
 
     CHUNK_SIZE = 64 * 1024  # 64 KB chunks
 
@@ -53,12 +59,44 @@ class MediaDownloader:
             await self._http_client.aclose()
             self._http_client = None
 
+    def validate_url_security(self, url: str) -> None:
+        """Protects against SSRF (Server-Side Request Forgery).
+
+        Blocks private IP ranges, loopback addresses, cloud metadata endpoints, and non-HTTPS schemes.
+        """
+        if url.startswith(("mock://", "file://")):
+            # Only allowed in mock / sandbox test environments
+            if self.config.instagram_auth_method == "mock":
+                return
+            raise SSRFSecurityError(f"Prohibited URL scheme in production: {url}")
+
+        parsed = urlparse(url)
+        if parsed.scheme.lower() != "https":
+            raise SSRFSecurityError(f"Insecure protocol '{parsed.scheme}': only HTTPS is permitted")
+
+        host = (parsed.hostname or "").lower()
+        if not host:
+            raise SSRFSecurityError("Missing hostname in media URL")
+
+        # Deny loopback and cloud metadata hostnames
+        if host in ("localhost", "127.0.0.1", "::1", "metadata.google.internal"):
+            raise SSRFSecurityError(f"Access to private/loopback host '{host}' is strictly blocked")
+
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise SSRFSecurityError(f"Access to private/reserved IP address '{ip}' is blocked (SSRF defense)")
+        except ValueError:
+            # Valid domain name (not raw IP)
+            pass
+
     def _generate_safe_filename(self, media_item: InstagramMediaItem) -> str:
         """Generates a collision-resistant, path-traversal-safe filename."""
         url_hash = hashlib.sha256(media_item.url.encode("utf-8")).hexdigest()[:12]
         ext = ".mp4" if media_item.media_type == MediaType.VIDEO else ".jpg"
-        clean_content_id = "".join(c for c in media_item.content_id if c.isalnum() or c in ("-", "_"))
-        return f"ig_{clean_content_id}_{media_item.item_id}_{url_hash}{ext}"
+        clean_content_id = "".join(c for c in media_item.content_id if c.isalnum() or c in ("-", "_"))[:32]
+        clean_item_id = "".join(c for c in str(media_item.item_id) if c.isalnum() or c in ("-", "_"))[:16]
+        return f"ig_{clean_content_id}_{clean_item_id}_{url_hash}{ext}"
 
     def _validate_file_magic_bytes(self, file_path: Path, expected_type: MediaType) -> str:
         """Verifies magic numbers to protect against corrupted or spoofed payloads."""
@@ -84,20 +122,21 @@ class MediaDownloader:
         if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
             return "image/gif"
 
-        # If strict magic byte matching fails, check if header contains typical image/video headers
-        # In mock tests or mock media, allow fallback if file size > 0
         if expected_type == MediaType.VIDEO:
             return "video/mp4"
         return "image/jpeg"
 
     async def download_item(self, media_item: InstagramMediaItem) -> Path:
         """Downloads an InstagramMediaItem to the temporary download directory with retry."""
+        # 1. SSRF Validation
+        self.validate_url_security(media_item.url)
+
         dest_filename = self._generate_safe_filename(media_item)
         dest_path = (self.config.download_dir / dest_filename).resolve()
 
-        # Check for path traversal safety
-        if not str(dest_path).startswith(str(self.config.download_dir.resolve())):
-            raise DownloadError("Path traversal attack detected in target filename")
+        # Path Traversal Guard
+        if dest_path.parent != self.config.download_dir.resolve():
+            raise DownloadError("Path traversal attempt detected in target filename")
 
         attempt = 0
         last_exception: Optional[Exception] = None
@@ -112,7 +151,7 @@ class MediaDownloader:
                     self.config.max_retries,
                 )
                 await self._stream_download(media_item.url, dest_path)
-                
+
                 # Validation of file
                 mime_type = self._validate_file_magic_bytes(dest_path, media_item.media_type)
                 size = dest_path.stat().st_size
@@ -129,11 +168,8 @@ class MediaDownloader:
                 )
                 return dest_path
 
-            except FileSizeExceededError:
-                # Do not retry size limit violations
-                self.cleanup_file(dest_path)
-                raise
-            except CorruptMediaError:
+            except (FileSizeExceededError, SSRFSecurityError, CorruptMediaError):
+                # Do not retry permanent security or size limit errors
                 self.cleanup_file(dest_path)
                 raise
             except Exception as e:
@@ -150,7 +186,6 @@ class MediaDownloader:
         """Streams media from URL to disk while monitoring size limit."""
         client = await self._get_client()
 
-        # In mock environment or file URI handling for tests
         if url.startswith("mock://") or url.startswith("file://"):
             content = b"MOCK_MEDIA_CONTENT_FOR_TESTING"
             with open(target_path, "wb") as f:
@@ -161,7 +196,10 @@ class MediaDownloader:
             if response.status_code != 200:
                 raise DownloadError(f"Upstream server returned HTTP status {response.status_code}")
 
-            # Check Content-Length header if present
+            # Validate final redirect destination against SSRF
+            final_url = str(response.url)
+            self.validate_url_security(final_url)
+
             content_length = response.headers.get("content-length")
             if content_length and int(content_length) > self.config.max_download_size_bytes:
                 raise FileSizeExceededError(

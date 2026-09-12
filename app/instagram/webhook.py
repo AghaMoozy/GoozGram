@@ -36,12 +36,16 @@ class InstagramWebhookHandler:
 
     def verify_challenge(self, query_string: str) -> Optional[str]:
         """Validates Meta webhook subscription verification challenge."""
+        if not self.config.instagram_verify_token:
+            logger.warning("Rejecting Meta Webhook challenge: INSTAGRAM_VERIFY_TOKEN is not configured")
+            return None
+
         params = parse_qs(query_string)
         mode = params.get("hub.mode", [""])[0]
         token = params.get("hub.verify_token", [""])[0]
         challenge = params.get("hub.challenge", [""])[0]
 
-        if mode == "subscribe" and token == self.config.instagram_verify_token:
+        if mode == "subscribe" and hmac.compare_digest(token, self.config.instagram_verify_token):
             logger.info("Meta Webhook verification challenge accepted")
             return challenge
 
@@ -51,8 +55,10 @@ class InstagramWebhookHandler:
     def verify_signature(self, payload: bytes, signature_header: str) -> bool:
         """Verifies HMAC SHA-256 signature from Meta if app secret is configured."""
         if not self.config.instagram_app_secret:
-            # If no secret configured, accept but log warning
-            return True
+            if self.config.instagram_auth_method == "mock":
+                return True
+            logger.error("Rejecting Webhook POST: INSTAGRAM_APP_SECRET is not configured for security")
+            return False
 
         if not signature_header or not signature_header.startswith("sha256="):
             logger.warning("Missing or malformed X-Hub-Signature-256 header")

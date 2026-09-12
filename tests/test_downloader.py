@@ -79,3 +79,38 @@ class TestDownloader(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSSRFDefense(unittest.TestCase):
+
+    def setUp(self):
+        self.cfg = Config(telegram_bot_token="test", instagram_auth_method="graph_api")
+        self.downloader = MediaDownloader(self.cfg)
+
+    def test_ssrf_blocked_hosts(self):
+        from app.instagram.downloader import SSRFSecurityError
+        blocked_urls = [
+            "http://127.0.0.1:8000/webhook",
+            "http://localhost:8000/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/admin",
+            "http://192.168.1.1/secret",
+            "http://172.16.0.1/internal",
+            "file:///etc/passwd",
+            "gopher://localhost:70/",
+        ]
+        for url in blocked_urls:
+            with self.assertRaises(SSRFSecurityError, msg=f"Failed to block SSRF URL: {url}"):
+                self.downloader.validate_url_security(url)
+
+    def test_ssrf_allowed_valid_https(self):
+        valid_urls = [
+            "https://instagram.fsan1-1.fna.fbcdn.net/v/t51.2885-15/pic.jpg",
+            "https://scontent.cdninstagram.com/v/t51.2885-15/video.mp4",
+            "https://images.unsplash.com/photo-1507525428034",
+        ]
+        for url in valid_urls:
+            try:
+                self.downloader.validate_url_security(url)
+            except Exception as e:
+                self.fail(f"Valid HTTPS URL unexpectedly raised error: {url} -> {e}")
